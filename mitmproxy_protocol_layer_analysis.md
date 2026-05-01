@@ -277,6 +277,558 @@ def __truediv__(self, other: Layer | LayerStack) -> LayerStack:
     return self
 ```
 
+### 隧道层握手完成的两条路径与时序保障
+
+`TunnelLayer` 设计了两条截然不同的握手完成路径，取决于**连接是已存在**还是**子层主动请求建立**。同时，初始化事件在握手期间被缓冲的机制保障了时序正确性。
+
+#### 核心变量
+
+```python
+class TunnelLayer(layer.Layer):
+    command_to_reply_to: commands.OpenConnection | None  # 关键：区分两条路径
+    _event_queue: list[events.Event]                      # 握手期间的事件缓冲
+    tunnel_state: TunnelState                             # 状态机
+```
+
+| 变量 | 作用 |
+|-----|------|
+| `command_to_reply_to` | 如果是子层主动请求建立连接，存储原始的 `OpenConnection` 命令；否则为 `None` |
+| `_event_queue` | 握手期间缓冲的事件，握手完成后重放 |
+| `tunnel_state` | 隧道状态：`INACTIVE` → `ESTABLISHING` → `OPEN`/`CLOSED` |
+
+---
+
+#### 路径 A：连接已存在场景（`command_to_reply_to is None`）
+
+**触发条件**：收到 `Start` 事件时，`tunnel_connection` 已经存在（非 `CLOSED` 状态）
+
+**典型场景**：
+- 反向代理模式：`ReverseProxy` 启动时，客户端连接已存在
+- 透明代理模式：客户端连接已建立，需要先进行 TLS 握手
+
+**执行流程**：
+
+```
+1. 收到 Start 事件
+   │
+   ▼
+2. _handle_event(Start) 检测：
+   tunnel_connection.state is not CLOSED → True
+   │
+   ▼
+3. 设置状态：tunnel_state = ESTABLISHING
+   │
+   ▼
+4. 调用 start_handshake()
+   │
+   ▼
+5. 调用 event_to_child(Start)  ← 注意：Start 事件在这里转发
+   │
+   ▼
+6. event_to_child 检测条件：
+   tunnel_state is ESTABLISHING AND not command_to_reply_to → True
+   │
+   ▼
+7. ⚠️ 事件被缓冲！
+   self._event_queue.append(event)
+   return  # 不转发给子层！
+   │
+   ▼
+8. 握手进行中...
+   - 收到 DataReceived → receive_handshake_data()
+   - 可能需要多轮数据交换
+   │
+   ▼
+9. 握手完成（或失败）
+   done = True 或 err is not None
+   │
+   ▼
+10. 调用 _handshake_finished(err)
+    │
+    ▼
+11. _handshake_finished 检测：
+    command_to_reply_to is None → True
+    │
+    ▼
+12. ⏰ 重放缓冲的事件！
+    for evt in self._event_queue:
+        yield from self.event_to_child(evt)
+    self._event_queue.clear()
+    │
+    ▼
+13. 子层终于收到 Start 事件
+    tunnel_state = OPEN （如果成功）
+```
+
+**关键代码路径** (`tunnel.py:55-63`)：
+
+```python
+def _handle_event(self, event: events.Event):
+    if isinstance(event, events.Start):
+        if self.tunnel_connection.state is not connection.ConnectionState.CLOSED:
+            self.tunnel_state = TunnelState.ESTABLISHING
+            yield from self.start_handshake()
+        yield from self.event_to_child(event)  # ← Start 事件在这里传入 event_to_child
+```
+
+**事件缓冲逻辑** (`tunnel.py:146-154`)：
+
+```python
+def event_to_child(self, event: events.Event):
+    # 关键条件：ESTABLISHING 且 没有 command_to_reply_to
+    if (
+        self.tunnel_state is TunnelState.ESTABLISHING
+        and not self.command_to_reply_to
+    ):
+        self._event_queue.append(event)  # 缓冲！
+        return  # 不转发！
+    
+    # 否则正常转发
+    for command in self.child_layer.handle_event(event):
+        yield from self._handle_command(command)
+```
+
+**握手完成处理** (`tunnel.py:100-113`)：
+
+```python
+def _handshake_finished(self, err: str | None):
+    if err:
+        self.tunnel_state = TunnelState.CLOSED
+    else:
+        self.tunnel_state = TunnelState.OPEN
+    
+    if self.command_to_reply_to:
+        # 路径 B：回复 OpenConnectionCompleted
+        ...
+    else:
+        # 路径 A：重放缓冲的事件
+        for evt in self._event_queue:
+            yield from self.event_to_child(evt)
+        self._event_queue.clear()
+```
+
+---
+
+#### 路径 B：子层主动请求连接场景（`command_to_reply_to is not None`）
+
+**触发条件**：子层产出 `OpenConnection` 命令
+
+**典型场景**：
+- HTTP CONNECT 隧道：`HttpStream.handle_connect()` 设置 `server.address`，然后 `NextLayer` 中的 `TLSLayer` 需要建立服务端连接
+- HTTP 请求需要建立新的服务端连接
+
+**执行流程**：
+
+```
+1. 子层（或子层的子层）需要建立连接
+   def some_function():
+       yield commands.OpenConnection(server_conn)  # blocking=True
+   │
+   ▼
+2. 命令向上冒泡，被 TunnelLayer._handle_command 捕获
+   │
+   ▼
+3. _handle_command 处理 OpenConnection：
+   self.command_to_reply_to = command  ← 存储原始命令！
+   self.tunnel_state = TunnelState.ESTABLISHING
+   │
+   ▼
+4. 产出新的 OpenConnection（针对 tunnel_connection）
+   err = yield commands.OpenConnection(self.tunnel_connection)
+   │
+   ▼
+5. 连接建立成功（err is None）
+   │
+   ▼
+6. 调用 start_handshake()
+   │
+   ▼
+7. 握手进行中...
+   - 注意：此时子层是暂停状态（因为 OpenConnection 是阻塞命令）
+   - 子层不会产生新的事件，不需要缓冲！
+   │
+   ▼
+8. 握手完成（或失败）
+   │
+   ▼
+9. 调用 _handshake_finished(err)
+   │
+   ▼
+10. _handshake_finished 检测：
+    command_to_reply_to is not None → True
+    │
+    ▼
+11. 产出 OpenConnectionCompleted 事件
+    yield from self.event_to_child(
+        events.OpenConnectionCompleted(self.command_to_reply_to, err)
+    )
+    self.command_to_reply_to = None
+    │
+    ▼
+12. 子层恢复执行！
+    # 子层的生成器从 yield 处继续
+    err = yield commands.OpenConnection(server_conn)
+    # err 现在是 OpenConnectionCompleted.reply
+```
+
+**关键代码路径** (`tunnel.py:115-144`)：
+
+```python
+def _handle_command(self, command: commands.Command):
+    if (
+        isinstance(command, commands.ConnectionCommand)
+        and command.connection == self.conn
+    ):
+        if isinstance(command, commands.OpenConnection):
+            # 存储原始命令，标记路径 B
+            self.command_to_reply_to = command
+            self.tunnel_state = TunnelState.ESTABLISHING
+            
+            # 发起实际连接（这是阻塞命令）
+            err = yield commands.OpenConnection(self.tunnel_connection)
+            
+            if err:
+                # 连接失败，直接回复子层
+                yield from self.event_to_child(
+                    events.OpenConnectionCompleted(command, err)
+                )
+                self.tunnel_state = TunnelState.CLOSED
+            else:
+                # 连接成功，开始握手
+                yield from self.start_handshake()
+```
+
+---
+
+#### 时序保障机制的设计意图
+
+**为什么路径 A 需要事件缓冲？**
+
+在路径 A 中，`Start` 事件的处理顺序是：
+
+```
+_handle_event(Start):
+    1. tunnel_state = ESTABLISHING
+    2. yield from start_handshake()  # 开始握手（可能异步）
+    3. yield from event_to_child(Start)  # ← 此时隧道还没建立好！
+```
+
+如果第 3 步直接将 `Start` 转发给子层，子层（如 `NextLayer`）可能会立即尝试使用尚未建立的隧道，导致时序错误。
+
+通过在 `event_to_child` 中检测 `ESTABLISHING and not command_to_reply_to`，所有在握手期间到达的事件（包括 `Start`）都会被安全地缓冲，直到 `_handshake_finished` 才重放。
+
+**为什么路径 B 不需要事件缓冲？**
+
+在路径 B 中：
+
+1. 子层产出 `OpenConnection`（阻塞命令）
+2. `handle_event` 检测到 `blocking is True`，暂停子层的生成器
+3. 子层进入"等待"状态，不会产生新的事件
+4. 握手完成后，`OpenConnectionCompleted` 触发子层恢复执行
+
+由于子层是暂停状态，握手期间不会有新的事件需要处理，因此不需要缓冲机制。
+
+---
+
+#### 两条路径对比总结
+
+| 对比项 | 路径 A（连接已存在） | 路径 B（子层主动请求） |
+|-------|---------------------|----------------------|
+| **触发条件** | 收到 `Start` 时连接已存在 | 子层产出 `OpenConnection` |
+| **`command_to_reply_to`** | `None` | 原始 `OpenConnection` 命令 |
+| **事件缓冲** | 需要（`_event_queue`） | 不需要 |
+| **子层状态** | 运行中，可能产生事件 | 暂停中（等待 `OpenConnectionCompleted`） |
+| **握手完成信号** | 重放缓冲的事件 | 产出 `OpenConnectionCompleted` |
+| **典型场景** | 反向代理 TLS 握手、透明代理 | HTTP CONNECT、新服务端连接 |
+
+#### 代码中的条件判断汇总
+
+```python
+# 1. _handle_event 中区分路径起点
+if isinstance(event, events.Start):
+    if self.tunnel_connection.state is not CLOSED:
+        # 可能进入路径 A
+        tunnel_state = ESTABLISHING
+        start_handshake()
+    event_to_child(event)  # Start 事件传入
+
+# 2. event_to_child 中决定是否缓冲
+if (
+    tunnel_state is ESTABLISHING
+    and not command_to_reply_to  # 关键：只有路径 A 缓冲
+):
+    _event_queue.append(event)
+    return
+
+# 3. _handle_command 中标记路径 B
+if isinstance(command, OpenConnection):
+    command_to_reply_to = command  # 标记路径 B
+    tunnel_state = ESTABLISHING
+    yield OpenConnection(tunnel_connection)  # 阻塞
+
+# 4. _handshake_finished 中区分完成处理
+if command_to_reply_to:
+    # 路径 B：回复 OpenConnectionCompleted
+    yield OpenConnectionCompleted(command_to_reply_to, err)
+    command_to_reply_to = None
+else:
+    # 路径 A：重放缓冲事件
+    for evt in _event_queue:
+        event_to_child(evt)
+    _event_queue.clear()
+```
+
+---
+
+#### 握手完成后的双路径机制深度解析
+
+`_handshake_finished` 方法是两条路径交汇的核心节点，其实现确保了**子层只有在隧道完全就绪后才开始处理事件**，这是保证子层状态机时序正确的关键设计。
+
+##### 核心代码：`_handshake_finished`
+
+```python
+# tunnel.py:100-113
+def _handshake_finished(self, err: str | None) -> layer.CommandGenerator[None]:
+    # 第一步：更新隧道状态
+    if err:
+        self.tunnel_state = TunnelState.CLOSED
+    else:
+        self.tunnel_state = TunnelState.OPEN  # 隧道状态更新为 OPEN
+    
+    # 第二步：根据路径类型选择完成方式
+    if self.command_to_reply_to:
+        # ==========================================
+        # 路径 B：子层主动发起建连请求
+        # 握手完成后 → 向子层回传连接建立结果通知
+        # ==========================================
+        yield from self.event_to_child(
+            events.OpenConnectionCompleted(self.command_to_reply_to, err)
+        )
+        self.command_to_reply_to = None
+    else:
+        # ==========================================
+        # 路径 A：连接已经存在（如客户端主动接入）
+        # 握手完成后 → 将握手期间缓冲的事件（包括初始化事件本身）依次重放给子层
+        # ==========================================
+        for evt in self._event_queue:
+            yield from self.event_to_child(evt)
+        self._event_queue.clear()
+```
+
+##### 路径 B：子层主动发起建连 → 回传连接建立结果
+
+**机制原理**：
+
+```
+子层（暂停中）                     TunnelLayer                    ConnectionHandler
+     │                                  │                              │
+     │                                  │                              │
+     │  yield OpenConnection(conn)      │                              │
+     │────────────────────────────────> │                              │
+     │                                  │                              │
+     │  (子层暂停，生成器保存状态)      │                              │
+     │                                  │                              │
+     │                                  │ yield OpenConnection(tunnel) │
+     │                                  │─────────────────────────────>│
+     │                                  │                              │
+     │                                  │        (异步等待连接建立)     │
+     │                                  │                              │
+     │                                  │  OpenConnectionCompleted      │
+     │                                  │<─────────────────────────────│
+     │                                  │                              │
+     │                                  │  start_handshake()            │
+     │                                  │  (TLS 握手进行中)            │
+     │                                  │                              │
+     │                                  │  握手完成 → _handshake_finished
+     │                                  │       │
+     │                                  │       ▼
+     │                                  │  command_to_reply_to 不为 None
+     │                                  │       │
+     │                                  │       ▼
+     │  OpenConnectionCompleted         │  yield OpenConnectionCompleted
+     │<──────────────────────────────── │  (通过 event_to_child)
+     │                                  │
+     │  (子层恢复执行！)
+     │  从 yield 处继续
+     │  err = yield OpenConnection(...)
+     │  # err 现在是握手结果
+```
+
+**关键设计点**：
+
+1. **生成器暂停机制**：子层产出 `OpenConnection` 后，`handle_event` 检测到 `blocking is True`，将子层的生成器保存到 `_paused` 中，子层暂停执行。
+
+2. **命令保存**：`command_to_reply_to` 保存了子层原始的 `OpenConnection` 命令引用，这样在握手完成后，可以将 `OpenConnectionCompleted` 事件准确地"回复"给子层。
+
+3. **回复机制**：`OpenConnectionCompleted` 事件携带 `command` 和 `err` 两个属性：
+   - `command`：原始的 `OpenConnection` 命令，用于 `handle_event` 匹配 `_paused.command`
+   - `err`：错误信息（成功时为 `None`）
+
+4. **子层恢复**：`handle_event` 收到 `OpenConnectionCompleted` 后，检查 `event.command is self._paused.command`，如果匹配则调用 `__continue` 恢复子层的生成器执行。
+
+##### 路径 A：连接已存在 → 重放缓冲事件
+
+**机制原理**：
+
+```
+时序（假设）：
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  T1: 收到 Start 事件                                                          │
+│      │                                                                        │
+│      ▼                                                                        │
+│  _handle_event(Start):                                                       │
+│    1. tunnel_state = ESTABLISHING                                           │
+│    2. yield from start_handshake()  → 可能触发多次 IO                       │
+│    3. yield from event_to_child(Start)  ← Start 事件转发                    │
+│                                                                              │
+│  event_to_child(Start) 检测：                                                │
+│    tunnel_state is ESTABLISHING AND not command_to_reply_to → True         │
+│    │                                                                         │
+│    ▼                                                                         │
+│  Start 事件被缓冲到 _event_queue！                                           │
+│  return  # 不转发给子层！                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+│  (握手进行中，可能需要多轮 DataReceived)
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  T2: 收到 DataReceived (TLS 数据)                                            │
+│      │                                                                        │
+│      ▼                                                                        │
+│  receive_handshake_data(data)                                                │
+│  处理 TLS 握手数据...                                                         │
+│                                                                              │
+│  (如果握手还没完成，继续等待下一个 DataReceived)                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+│  (握手完成，done = True)
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  T3: 握手完成                                                                 │
+│      │                                                                        │
+│      ▼                                                                        │
+│  _handshake_finished(err=None)                                               │
+│      │                                                                        │
+│      ▼                                                                        │
+│  1. tunnel_state = OPEN  ← 隧道状态更新为 OPEN！                             │
+│      │                                                                        │
+│      ▼                                                                        │
+│  2. 检测 command_to_reply_to → None                                          │
+│      │                                                                        │
+│      ▼                                                                        │
+│  3. 重放缓冲的事件！                                                          │
+│     for evt in self._event_queue:                                            │
+│         yield from self.event_to_child(evt)                                  │
+│                                                                              │
+│     此时 event_to_child 检测：                                                │
+│     tunnel_state is ESTABLISHING? → NO，现在是 OPEN！                       │
+│     → 事件直接转发给子层！                                                    │
+│                                                                              │
+│  4. self._event_queue.clear()                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+子层终于收到 Start 事件！
+此时隧道状态已为 OPEN，子层可以安全地使用隧道。
+```
+
+**关键设计点**：
+
+1. **缓冲条件的精确设计**：`event_to_child` 中的缓冲条件是：
+   ```python
+   if (
+       self.tunnel_state is TunnelState.ESTABLISHING  # 握手进行中
+       and not self.command_to_reply_to                 # 且不是路径 B
+   ):
+   ```
+   这意味着：
+   - 只有当隧道状态是 `ESTABLISHING` 且 `command_to_reply_to` 为 `None` 时才缓冲
+   - 一旦 `tunnel_state` 变为 `OPEN` 或 `CLOSED`，条件不再满足，事件直接转发
+
+2. **初始化事件本身也被缓冲**：`Start` 事件在 `_handle_event` 中通过 `yield from event_to_child(event)` 转发，而此时 `tunnel_state` 已经是 `ESTABLISHING`，所以 `Start` 事件本身也被缓冲。
+
+3. **重放时隧道已就绪**：`_handshake_finished` 首先更新 `tunnel_state = OPEN`（或 `CLOSED`），然后才重放事件。此时 `event_to_child` 的缓冲条件不再满足，事件直接转发给子层。
+
+##### 时序保障：确保子层状态机正确的关键设计
+
+**为什么这个设计如此重要？**
+
+假设没有这个缓冲机制，会发生什么？
+
+```
+没有缓冲机制的错误时序：
+
+1. _handle_event(Start):
+   tunnel_state = ESTABLISHING
+   start_handshake()  # 开始 TLS 握手（异步）
+   
+   # 错误：直接将 Start 转发给子层
+   event_to_child(Start)  # ← 此时隧道还没建立！
+
+2. 子层（如 NextLayer）收到 Start：
+   - 触发 NextLayerHook
+   - addon 设置 child_layer = HttpLayer
+   
+3. HttpLayer 收到 Start：
+   - 根据 ALPN 选择 HTTP 版本
+   - 尝试使用 TLS 连接的解密数据
+   
+   但此时 TLS 握手还没完成！
+   - conn.alpn 还是 None
+   - 隧道还无法传递数据
+   
+   这会导致：
+   - 子层状态机初始化错误
+   - 后续事件处理混乱
+   - 可能的竞态条件
+```
+
+**正确的时序（有缓冲机制）**：
+
+```
+1. _handle_event(Start):
+   tunnel_state = ESTABLISHING
+   start_handshake()
+   
+   # Start 被缓冲，不转发给子层
+   event_to_child(Start) → _event_queue.append(Start)
+
+2. 握手进行中...
+   (子层完全不知道这一切，还没收到任何事件)
+
+3. 握手完成：
+   _handshake_finished(err=None):
+   tunnel_state = OPEN  # ← 先更新状态
+   
+   # 现在重放事件
+   for evt in _event_queue:  # 包含 Start
+       event_to_child(evt)
+       
+       # 此时 tunnel_state 是 OPEN，不缓冲
+       # 事件直接转发给子层
+
+4. 子层收到 Start：
+   - 此时 tunnel_state 已为 OPEN
+   - conn.alpn 已设置（如果是 TLS）
+   - 隧道已就绪，可以安全使用
+   
+   子层状态机正确初始化！
+```
+
+##### 双路径机制的设计哲学
+
+| 设计原则 | 路径 A（连接已存在） | 路径 B（子层主动请求） |
+|---------|---------------------|----------------------|
+| **子层状态** | 运行中，但事件被缓冲 | 暂停中（生成器保存状态） |
+| **同步机制** | 事件缓冲队列 `_event_queue` | 阻塞命令 + `command_to_reply_to` |
+| **完成信号** | 重放缓冲的事件（包括 `Start`） | 回传 `OpenConnectionCompleted` |
+| **保障目标** | 子层只有在隧道就绪后才收到初始化事件 | 子层只有在隧道就绪后才恢复执行 |
+| **关键条件** | `tunnel_state is ESTABLISHING and not command_to_reply_to` | `command_to_reply_to is not None` |
+
+**核心思想**：无论哪种路径，**子层的状态机初始化（收到 `Start` 或恢复执行）都发生在隧道状态变为 `OPEN` 之后**。这确保了子层在开始处理时，隧道已经完全就绪，不会出现"使用未初始化资源"的时序错误。
+
 ### 典型嵌套结构示例
 
 #### HTTPS 请求的协议栈
