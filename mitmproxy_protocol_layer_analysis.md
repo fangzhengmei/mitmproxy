@@ -604,11 +604,21 @@ def handle_connect(self) -> CommandGenerator[None]:
 
 #### `passthrough` 模式：协议透明转换
 
-`passthrough` 方法 (`http/__init__.py:848`) 实现了 HTTP 事件与原始连接事件的双向转换：
+`passthrough` 方法 (`http/__init__.py:848`) 实现了 HTTP 事件与原始连接事件的双向转换。**关键在于：CONNECT 隧道（200 响应）与协议升级（101 响应）在服务端方向的处理逻辑完全不同**。
+
+##### 核心差异分析
+
+代码中的关键条件是 `self.flow.response.status_code == 101`：
 
 ```python
 def passthrough(self, event: events.Event) -> CommandGenerator[None]:
-    # HTTP 事件 → 原始连接事件
+    assert self.flow.response
+    assert self.child_layer
+    
+    # ==========================================
+    # 第一部分：HTTP 事件 → 原始连接事件
+    # （这部分对 CONNECT 和 WebSocket 是相同的）
+    # ==========================================
     if isinstance(event, RequestData):
         event = events.DataReceived(self.context.client, event.data)
     elif isinstance(event, ResponseData):
@@ -617,30 +627,86 @@ def passthrough(self, event: events.Event) -> CommandGenerator[None]:
         event = events.ConnectionClosed(self.context.client)
     elif isinstance(event, ResponseEndOfMessage):
         event = events.ConnectionClosed(self.context.server)
-    
-    # 转发给子层
+
+    # ==========================================
+    # 第二部分：原始连接命令 → HTTP 事件（或直接透传）
+    # （这部分对 CONNECT 和 WebSocket 有本质区别）
+    # ==========================================
     for command in self.child_layer.handle_event(event):
-        # 原始连接命令 → HTTP 事件
         if isinstance(command, commands.SendData):
+            # 客户端方向：总是封装为 HTTP 事件
             if command.connection == self.context.client:
                 yield SendHttp(
-                    ResponseData(self.stream_id, command.data), 
-                    self.context.client
+                    ResponseData(self.stream_id, command.data), self.context.client
                 )
-            elif command.connection == self.context.server:
+            # 服务端方向：检查是否为协议升级（101）
+            elif (
+                command.connection == self.context.server
+                and self.flow.response.status_code == 101  # 关键条件！
+            ):
+                # WebSocket 等协议升级：服务端连接也是 HTTP 层管理的
+                # 需要封装为 HTTP 事件
                 yield SendHttp(
-                    RequestData(self.stream_id, command.data), 
-                    self.context.server
+                    RequestData(self.stream_id, command.data), self.context.server
                 )
+            else:
+                # CONNECT 隧道（200 响应）：服务端连接不是 HTTP 层管理的
+                # 直接透传命令，不封装为 HTTP 事件
+                yield command
+        
         elif isinstance(command, commands.CloseConnection):
-            # 转换为协议错误来关闭流
-            yield SendHttp(
-                ResponseProtocolError(self.stream_id, "EOF", ErrorCode.PASSTHROUGH_CLOSE),
-                self.context.client
-            )
+            # 客户端方向：总是封装为 HTTP 事件
+            if command.connection == self.context.client:
+                yield SendHttp(
+                    ResponseProtocolError(
+                        self.stream_id, "EOF", ErrorCode.PASSTHROUGH_CLOSE
+                    ),
+                    self.context.client,
+                )
+            # 服务端方向：检查是否为协议升级（101）
+            elif (
+                command.connection == self.context.server
+                and self.flow.response.status_code == 101  # 同样的关键条件！
+            ):
+                # WebSocket 等协议升级：封装为 HTTP 事件
+                yield SendHttp(
+                    RequestProtocolError(
+                        self.stream_id, "EOF", ErrorCode.PASSTHROUGH_CLOSE
+                    ),
+                    self.context.server,
+                )
+            else:
+                # CONNECT 隧道：直接透传
+                if isinstance(command, commands.CloseTcpConnection):
+                    command = commands.CloseConnection(command.connection)
+                yield command
+        
         else:
             yield command
 ```
+
+##### 差异原因（代码注释说明）
+
+```python
+# http/__init__.py:872-873
+# there only is a HTTP server connection if we have switched protocols,
+# not if a connection is established via CONNECT.
+```
+
+**解释**：
+- **协议升级（WebSocket 等，101 响应）**：服务端连接是通过 `HttpLayer` 的 `HttpClient` 机制管理的（`Http1Client`/`Http2Client`），所以子层产出的命令需要封装为 `SendHttp` 事件，由 HTTP 连接层处理。
+- **CONNECT 隧道（200 响应）**：服务端连接是通过 `NextLayer` 全新建立的独立连接（如 `TLSLayer` 包裹的原始 TCP 连接），不经过 HTTP 层管理，所以命令直接透传给上层 `ConnectionHandler` 执行。
+
+##### 数据流对比
+
+| 方向 | WebSocket 升级 (101) | CONNECT 隧道 (200) |
+|-----|---------------------|---------------------|
+| **客户端数据流入** | `RequestData` → `DataReceived(client)` | 相同 |
+| **服务端数据流入** | `ResponseData` → `DataReceived(server)` | 相同 |
+| **客户端数据流出** | `SendData(client)` → `SendHttp(ResponseData)` | 相同 |
+| **服务端数据流出** | `SendData(server)` → `SendHttp(RequestData)` | `SendData(server)` → **直接透传** |
+| **客户端关闭** | `CloseConnection(client)` → `SendHttp(ResponseProtocolError)` | 相同 |
+| **服务端关闭** | `CloseConnection(server)` → `SendHttp(RequestProtocolError)` | `CloseConnection(server)` → **直接透传** |
 
 ### WebSocket 升级机制
 
