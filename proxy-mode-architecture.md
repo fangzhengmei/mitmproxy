@@ -1567,4 +1567,97 @@ WireGuard、Local、TUN 这三种模式都复用了透明代理的处理流程�
 ### 8.1 核心文件
 
 | 文件路径 | 职责 |
-|
+|---------|------|
+| `mitmproxy/proxy/mode_specs.py` | 代理模式定义与解析 |
+| `mitmproxy/proxy/mode_servers.py` | 各模式服务器实例实现 |
+| `mitmproxy/proxy/server.py` | 核心连接处理器 `ConnectionHandler` |
+| `mitmproxy/proxy/layer.py` | Layer 基类与 NextLayer 机制 |
+| `mitmproxy/proxy/layers/modes.py` | 顶层模式层实现 |
+| `mitmproxy/proxy/layers/http/__init__.py` | HTTP 协议层实现 |
+| `mitmproxy/proxy/layers/tls.py` | TLS/DTLS 协议层实现 |
+| `mitmproxy/addons/next_layer.py` | 层决策 addon |
+| `mitmproxy/addons/proxyserver.py` | 代理服务器管理 addon |
+
+### 8.2 关键类与函数
+
+| 类/函数 | 文件位置 | 作用 |
+|---------|---------|------|
+| `ProxyMode` | `mode_specs.py:46` | 代理模式基类 |
+| `ServerInstance` | `mode_servers.py:91` | 服务器实例基类 |
+| `AsyncioServerInstance` | `mode_servers.py:222` | 异步服务器基类 |
+| `ConnectionHandler` | `server.py:98` | 核心连接调度器 |
+| `ProxyConnectionHandler` | `mode_servers.py:61` | 代理连接处理器 |
+| `Layer` | `layer.py:44` | 协议层基类 |
+| `NextLayer` | `layer.py:248` | 层决策占位符 |
+| `HttpLayer` | `layers/http/__init__.py:921` | HTTP 协议层 |
+| `TLSLayer` | `layers/tls.py:242` | TLS 协议层 |
+
+### 8.3 关键设计模式位置
+
+| 设计模式 | 实现位置 |
+|---------|---------|
+| 工厂模式 | `mode_servers.py:110-122` - `ServerInstance.make()` |
+| 责任链模式 | `layer.py` - Layer 栈的 `handle_event` 传递 |
+| 策略模式 | `addons/next_layer.py` - `_next_layer()` 决策逻辑 |
+| 状态机模式 | `layers/modes.py` - `Socks5Proxy` 的状态处理 |
+| 模板方法模式 | `server.py` - `ConnectionHandler.handle_client()` |
+
+---
+
+## 九、总结
+
+mitmproxy 的多入口流量分发架构是一个精心设计的分层架构，通过以下关键点实现了统一与灵活的平衡：
+
+### 9.1 三层入口架构
+
+1. **模式解析层** (`mode_specs.py`)：
+   - 统一的模式规格解析
+   - 支持 `模式[:配置][@监听地址:端口]` 语法
+   - 自动注册机制简化扩展
+
+2. **服务器实例层** (`mode_servers.py`)：
+   - 每种模式独立的服务器实现
+   - 统一的 `handle_stream()` 入口
+   - 透明代理类模式复用 `TransparentProxy`
+
+3. **顶层模式层** (`layers/modes.py`)：
+   - 处理模式特有协议握手
+   - 统一创建 `NextLayer` 进入核心流程
+   - `DestinationKnown` 基类抽象目标已知的模式
+
+### 9.2 统一核心流程
+
+所有模式最终都通过以下统一节点进入核心处理：
+
+1. **`ServerInstance.handle_stream()`** - 创建统一的 `ProxyConnectionHandler`
+2. **`ConnectionHandler.handle_client()`** - 统一的连接生命周期管理
+3. **`NextLayerHook`** - 模式相关与模式无关的分界点
+4. **`next_layer` addon** - 统一的协议识别和层决策逻辑
+
+### 9.3 架构优势
+
+1. **高内聚低耦合**：
+   - 模式特有逻辑集中在顶层模式层
+   - 核心协议层与模式完全解耦
+   - 新增模式无需修改核心代码
+
+2. **优秀的可扩展性**：
+   - 通过继承 `ProxyMode` 和 `ServerInstance` 新增模式
+   - 通过监听 `NextLayerHook` 自定义层决策
+   - 通过 addon 系统扩展功能
+
+3. **统一的运维体验**：
+   - 所有模式共享相同的超时管理
+   - 统一的生命周期钩子
+   - 一致的日志格式和错误处理
+
+4. **灵活的传输层抽象**：
+   - TCP/UDP 抽象为统一的 `Stream` 接口
+   - WireGuard、Local、TUN 等虚拟网络透明复用现有流程
+
+这种架构设计使得 mitmproxy 能够同时支持多达 9 种不同的代理模式，而保持核心处理逻辑的统一和简洁。
+
+---
+
+*报告生成时间: 2026-05-03*  
+*分析基于 mitmproxy 源码版本*
